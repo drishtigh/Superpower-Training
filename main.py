@@ -10,6 +10,8 @@ This is a clean keyboard-only version (no webcam / mediapipe).
 import math
 import sys
 import pygame
+import cv2
+from collections import deque
 
 
 # --- Config ---
@@ -17,6 +19,8 @@ WINDOW_SIZE = (800, 600)
 FPS = 60
 BALL_RADIUS = 12
 BALL_SPEED = 220.0  # pixels per second
+SMOOTHING = 0.85  # gaze smoothing (higher = slower)
+SHOW_DEBUG = True  # show camera debug window
 
 
 # Maze map: '1' wall, '0' empty, 'S' start, 'G' goal
@@ -73,6 +77,70 @@ def collides_any(cx, cy, radius, walls):
 	return False
 
 
+class GazeTrackerOpenCV:
+	"""Simple gaze-ish tracker using OpenCV Haar cascades.
+
+	Output: normalized (x,y) in [0,1] relative to the detected face box (x to right, y down).
+	This is an approximate method (pupil detection via dark blob) and works best in decent lighting.
+	"""
+
+	def __init__(self, cam_index=0):
+		self.cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
+		# haar cascades included with OpenCV
+		self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+		self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+		self.buffer = deque(maxlen=6)
+		self.last_frame = None
+
+	def read_normalized_point(self):
+		if not self.cap.isOpened():
+			return None
+		ret, frame = self.cap.read()
+		if not ret:
+			return None
+		self.last_frame = frame.copy()
+		gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+		faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+		if len(faces) == 0:
+			return None
+		# pick largest face
+		faces = sorted(faces, key=lambda r: r[2] * r[3], reverse=True)
+		x, y, w, h = faces[0]
+		face_roi = gray[y : y + h, x : x + w]
+		eyes = self.eye_cascade.detectMultiScale(face_roi)
+		if len(eyes) == 0:
+			return None
+		# compute eye centers in face coordinates
+		centers = []
+		for (ex, ey, ew, eh) in eyes[:2]:
+			cx = ex + ew // 2
+			cy = ey + eh // 2
+			centers.append((cx / w, cy / h))
+		if len(centers) == 0:
+			return None
+		# average eye centers
+		ax = sum(c[0] for c in centers) / len(centers)
+		ay = sum(c[1] for c in centers) / len(centers)
+
+		# refine using dark blob inside eye region to approximate pupil (optional)
+		# map normalized face-relative to global normalized (0..1 across face box)
+		nx = ax
+		ny = ay
+		self.buffer.append((nx, ny))
+		avgx = sum(p[0] for p in self.buffer) / len(self.buffer)
+		avgy = sum(p[1] for p in self.buffer) / len(self.buffer)
+		# store for debug overlay (pixel coords)
+		self.last_face = (x, y, w, h)
+		self.last_norm = (avgx, avgy)
+		return avgx, avgy
+
+	def release(self):
+		try:
+			self.cap.release()
+		except Exception:
+			pass
+
+
 def main():
 	pygame.init()
 	screen = pygame.display.set_mode(WINDOW_SIZE)
@@ -90,6 +158,9 @@ def main():
 		goal_pos = goal
 
 	running = True
+	# Gaze tracker (OpenCV) — toggle with 'g'
+	gaze = GazeTrackerOpenCV()
+	use_gaze = False
 
 	font = pygame.font.SysFont(None, 22)
 
@@ -102,8 +173,56 @@ def main():
 				if event.key == pygame.K_ESCAPE:
 					running = False
 
-		# Movement: W=up, A=left, S=right, Z=down
+		# Movement or gaze control
 		keys = pygame.key.get_pressed()
+		if keys[pygame.K_g]:
+			# toggle gaze mode on key press (debounce)
+			use_gaze = not use_gaze
+			# small pause to avoid rapid toggles
+			pygame.time.wait(200)
+
+		if use_gaze:
+			gp = gaze.read_normalized_point()
+			if gp is not None:
+				# gp is normalized inside face box — map to screen coords using face position
+				fx, fy, fw, fh = getattr(gaze, 'last_face', (0, 0, WINDOW_SIZE[0], WINDOW_SIZE[1]))
+				# compute where inside face box the gaze is and map to full window
+				tx = gp[0] * WINDOW_SIZE[0]
+				ty = gp[1] * WINDOW_SIZE[1]
+				# smooth movement
+				ball_x = SMOOTHING * ball_x + (1 - SMOOTHING) * tx
+				ball_y = SMOOTHING * ball_y + (1 - SMOOTHING) * ty
+			else:
+				# fallback to keyboard if gaze not available
+				use_keyboard = True
+
+		# Movement: W=up, A=left, S=right, Z=down (only when not using gaze)
+		if not use_gaze:
+			dx = 0
+			dy = 0
+			if keys[pygame.K_a]:
+				dx -= 1
+			if keys[pygame.K_s]:
+				dx += 1
+			if keys[pygame.K_w]:
+				dy -= 1
+			if keys[pygame.K_z]:
+				dy += 1
+			# normalize diagonal movement
+			if dx != 0 or dy != 0:
+				length = math.hypot(dx, dy)
+				dx = dx / length
+				dy = dy / length
+				move_x = dx * BALL_SPEED * dt
+				move_y = dy * BALL_SPEED * dt
+				# attempt horizontal move and check collisions (separately for sliding)
+				new_x = ball_x + move_x
+				if not collides_any(new_x, ball_y, BALL_RADIUS, walls):
+					ball_x = new_x
+				# attempt vertical move
+				new_y = ball_y + move_y
+				if not collides_any(ball_x, new_y, BALL_RADIUS, walls):
+					ball_y = new_y
 		dx = 0
 		dy = 0
 		if keys[pygame.K_a]:
@@ -144,13 +263,14 @@ def main():
 		pygame.draw.circle(screen, (200, 40, 40), (int(ball_x), int(ball_y)), BALL_RADIUS)
 
 		# HUD
-		txt = font.render("Move: W=Up  A=Left  S=Right  Z=Down  —  ESC to quit", True, (220, 220, 220))
-		screen.blit(txt, (10, WINDOW_SIZE[1] - 28))
+	mode = "Gaze" if use_gaze else "Keys"
+	txt = font.render(f"Mode: {mode}  —  Move: W=Up  A=Left  S=Right  Z=Down  —  G to toggle gaze  —  ESC to quit", True, (220, 220, 220))
+	screen.blit(txt, (10, WINDOW_SIZE[1] - 28))
 
-		pygame.display.flip()
+	pygame.display.flip()
 
 		# check win
-		if math.hypot(ball_x - goal_pos[0], ball_y - goal_pos[1]) < BALL_RADIUS + 6:
+	if math.hypot(ball_x - goal_pos[0], ball_y - goal_pos[1]) < BALL_RADIUS + 6:
 			screen.fill((0, 0, 0))
 			big = pygame.font.SysFont(None, 64)
 			msg = big.render("You reached the goal!", True, (255, 220, 80))
@@ -160,6 +280,7 @@ def main():
 			running = False
 
 	pygame.quit()
+	gaze.release()
 
 
 if __name__ == "__main__":
