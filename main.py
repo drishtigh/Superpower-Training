@@ -113,8 +113,21 @@ class GazeTrackerOpenCV:
 		# compute eye centers in face coordinates
 		centers = []
 		for (ex, ey, ew, eh) in eyes[:2]:
-			cx = ex + ew // 2
-			cy = ey + eh // 2
+			# try to refine pupil location by finding the darkest point inside the eye region
+			try:
+				eye_roi = face_roi[ey : ey + eh, ex : ex + ew]
+				if eye_roi.size == 0:
+					raise ValueError("empty eye ROI")
+				blur = cv2.GaussianBlur(eye_roi, (7, 7), 0)
+				(minVal, maxVal, minLoc, maxLoc) = cv2.minMaxLoc(blur)
+				px, py = minLoc
+				# pupil candidate in face coords
+				cx = ex + int(px)
+				cy = ey + int(py)
+			except Exception:
+				# fallback to eye bounding-box center
+				cx = ex + ew // 2
+				cy = ey + eh // 2
 			centers.append((cx / w, cy / h))
 		if len(centers) == 0:
 			return None
@@ -172,32 +185,39 @@ def main():
 			elif event.type == pygame.KEYDOWN:
 				if event.key == pygame.K_ESCAPE:
 					running = False
+				elif event.key == pygame.K_g:
+					# toggle gaze mode on key press
+					use_gaze = not use_gaze
 
-		# Movement or gaze control
 		keys = pygame.key.get_pressed()
-		if keys[pygame.K_g]:
-			# toggle gaze mode on key press (debounce)
-			use_gaze = not use_gaze
-			# small pause to avoid rapid toggles
-			pygame.time.wait(200)
 
 		if use_gaze:
 			gp = gaze.read_normalized_point()
 			if gp is not None:
-				# gp is normalized inside face box — map to screen coords using face position
+				# map normalized gaze (relative to face box) to screen coordinates
 				fx, fy, fw, fh = getattr(gaze, 'last_face', (0, 0, WINDOW_SIZE[0], WINDOW_SIZE[1]))
-				# compute where inside face box the gaze is and map to full window
-				tx = gp[0] * WINDOW_SIZE[0]
-				ty = gp[1] * WINDOW_SIZE[1]
-				# smooth movement
-				ball_x = SMOOTHING * ball_x + (1 - SMOOTHING) * tx
-				ball_y = SMOOTHING * ball_y + (1 - SMOOTHING) * ty
-			else:
-				# fallback to keyboard if gaze not available
-				use_keyboard = True
-
-		# Movement: W=up, A=left, S=right, Z=down (only when not using gaze)
-		if not use_gaze:
+				tx = fx + gp[0] * fw
+				ty = fy + gp[1] * fh
+				# compute a smoothed target position
+				target_x = SMOOTHING * ball_x + (1 - SMOOTHING) * tx
+				target_y = SMOOTHING * ball_y + (1 - SMOOTHING) * ty
+				# move toward target but cap movement by BALL_SPEED * dt and respect collisions
+				vx = target_x - ball_x
+				vy = target_y - ball_y
+				dist = math.hypot(vx, vy)
+				if dist > 1e-6:
+					maxstep = BALL_SPEED * dt
+					step = min(dist, maxstep)
+					nx = ball_x + (vx / dist) * step
+					ny = ball_y + (vy / dist) * step
+					# attempt horizontal move and check collisions (separately for sliding)
+					if not collides_any(nx, ball_y, BALL_RADIUS, walls):
+						ball_x = nx
+					# attempt vertical move
+					if not collides_any(ball_x, ny, BALL_RADIUS, walls):
+						ball_y = ny
+		else:
+			# Movement: W=up, A=left, S=right, Z=down
 			dx = 0
 			dy = 0
 			if keys[pygame.K_a]:
@@ -223,33 +243,7 @@ def main():
 				new_y = ball_y + move_y
 				if not collides_any(ball_x, new_y, BALL_RADIUS, walls):
 					ball_y = new_y
-		dx = 0
-		dy = 0
-		if keys[pygame.K_a]:
-			dx -= 1
-		if keys[pygame.K_s]:
-			dx += 1
-		if keys[pygame.K_w]:
-			dy -= 1
-		if keys[pygame.K_z]:
-			dy += 1
 
-		# normalize diagonal movement
-		if dx != 0 or dy != 0:
-			length = math.hypot(dx, dy)
-			dx = dx / length
-			dy = dy / length
-			move_x = dx * BALL_SPEED * dt
-			move_y = dy * BALL_SPEED * dt
-
-			# attempt horizontal move and check collisions (separately for sliding)
-			new_x = ball_x + move_x
-			if not collides_any(new_x, ball_y, BALL_RADIUS, walls):
-				ball_x = new_x
-			# attempt vertical move
-			new_y = ball_y + move_y
-			if not collides_any(ball_x, new_y, BALL_RADIUS, walls):
-				ball_y = new_y
 
 		# Drawing
 		screen.fill((30, 30, 40))
@@ -263,14 +257,14 @@ def main():
 		pygame.draw.circle(screen, (200, 40, 40), (int(ball_x), int(ball_y)), BALL_RADIUS)
 
 		# HUD
-	mode = "Gaze" if use_gaze else "Keys"
-	txt = font.render(f"Mode: {mode}  —  Move: W=Up  A=Left  S=Right  Z=Down  —  G to toggle gaze  —  ESC to quit", True, (220, 220, 220))
-	screen.blit(txt, (10, WINDOW_SIZE[1] - 28))
+		mode = "Gaze" if use_gaze else "Keys"
+		txt = font.render(f"Mode: {mode}  —  Move: W=Up  A=Left  S=Right  Z=Down  —  G to toggle gaze  —  ESC to quit", True, (220, 220, 220))
+		screen.blit(txt, (10, WINDOW_SIZE[1] - 28))
 
-	pygame.display.flip()
+		pygame.display.flip()
 
 		# check win
-	if math.hypot(ball_x - goal_pos[0], ball_y - goal_pos[1]) < BALL_RADIUS + 6:
+		if math.hypot(ball_x - goal_pos[0], ball_y - goal_pos[1]) < BALL_RADIUS + 6:
 			screen.fill((0, 0, 0))
 			big = pygame.font.SysFont(None, 64)
 			msg = big.render("You reached the goal!", True, (255, 220, 80))
